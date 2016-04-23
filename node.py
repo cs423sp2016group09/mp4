@@ -15,6 +15,7 @@ import time
 import signal
 import messaging
 
+
 def signal_handler(signal, frame):
     print 'You pressed Ctrl+C!'
     sys.exit(0)
@@ -45,7 +46,6 @@ def send_some_jobs(sock, jobs):
 
     messaging.send_msg(sock, data)
     # print "sent %d bytes" % len(data)
-
 
 
 def receive_data(sock):
@@ -86,11 +86,13 @@ def receive_data(sock):
 
 def receive_state(message):
     print "receiving state"
-    pats = re.match(r"(.*)#(.*)")
+    pats = re.match(r"(.*)#(.*)", message)
     other_length = int(pats.group(1))
     other_load_policy = float(pats.group(2))
 
-    return (other_length, other_load_policy)
+    other_state = (other_length, other_load_policy)
+    state_manager.handle_received_state(other_state)
+    return other_state
 
 
 def receive_some_jobs(message):
@@ -151,6 +153,7 @@ else:
     print "First job is indices %d to %d\nLast job is indices %d to %d" % (first_l, first_r, last_l, last_r)
     # print next
 
+
 class StateManager(threading.Thread):
 
     def __init__(self, sock):
@@ -161,12 +164,17 @@ class StateManager(threading.Thread):
         self.running = True
         self.sock = sock
 
+    def handle_received_state(self, (other_length, other_load_policy)):
+        print "i am being asked to handle other state"
+        print "other_length", other_length, "other_lp", other_load_policy
+
     def run(self):
         while (self.running):
             time.sleep(5)
             # data = "#%f#%d#" % (load_policy, len(job_queue))
             # send_msg(self.sock, data)
             hardware_monitor.send_state(self.sock)
+
 
 class AdaptorThread(threading.Thread):
 
@@ -185,6 +193,8 @@ class AdaptorThread(threading.Thread):
             # send_msg(self.sock, data)
 
 # sole job is to enforce the work time policy
+
+
 class HardwareMonitor(threading.Thread):
 
     def __init__(self, load_policy):
@@ -207,7 +217,6 @@ class HardwareMonitor(threading.Thread):
         else:
             print "The load policy is must be in range (0,1)!!!!"
         self.update_work_interval()
-
 
     def update_work_interval(self):
         self.work_interval = self.load_policy * 100.0 / 1000.0
@@ -263,9 +272,9 @@ class WorkerThread(threading.Thread):
                         load_policy_enforcer_event.wait()
                         array[i] += 1.111111
 
-
                 finished_queue.append(job)
                 # a[left_index:right_index] = array
+
 
 class TransferManager(threading.Thread):
 
@@ -282,7 +291,6 @@ class TransferManager(threading.Thread):
     def request_transfer(self, jobs):
         self.wake.set()
         self.jobs_to_send = jobs
-
 
     def run(self):
         while (self.running):
@@ -316,9 +324,7 @@ while running:
     for sender in senders:
         # received packets
         if sender == comm_sock:
-            a = messaging.recv_msg(comm_sock)
-
-            print "received message", a
+            receive_data(comm_sock)
         # handle keyboard input
         elif sender == sys.stdin:
             thing = sys.stdin.readline().rstrip('\n')
