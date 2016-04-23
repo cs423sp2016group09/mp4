@@ -29,6 +29,10 @@ num_jobs = 512
 
 a = [0.0] * SIZE
 
+# multiplier constant
+# this is a blind guess
+k = 4
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-r", "--remote", help="Add this flag if this is the remote node", action="store_true")
 # maybe later
@@ -165,8 +169,13 @@ class StateManager(threading.Thread):
         self.sock = sock
 
     def handle_received_state(self, (other_length, other_load_policy)):
-        print "i am being asked to handle other state"
-        print "other_length", other_length, "other_lp", other_load_policy
+        # print "i am being asked to handle other state"
+        # print "other_length", other_length, "other_lp", other_load_policy
+        my_length = len(job_queue)
+        my_load_policy = hardware_monitor.load_policy
+        bundle = (my_length, my_load_policy, other_length, other_load_policy)
+        # send bundle to adapter
+        adaptor_thread.request_calculation(bundle)
 
     def run(self):
         while (self.running):
@@ -185,13 +194,24 @@ class AdaptorThread(threading.Thread):
         threading.Thread.__init__(self)
         self.running = True
         self.sock = sock
+        self.bundle = ()
+        self.wake = threading.Event()
+
+    def request_calculation(self, bundle):
+        self.bundle = bundle
+        self.wake.set()
 
     def run(self):
         while (self.running):
-            time.sleep(5)
-            # data = "#%f#%d#" % (load_policy, len(job_queue))
-            # send_msg(self.sock, data)
+            self.wake.wait()
+            # do some work
 
+            (my_length, my_load_policy, other_length, other_load_policy) = self.bundle
+
+            print "i'm performing a calculation on ", my_length, my_load_policy, other_length, other_load_policy
+
+            self.jobs_to_send = ()
+            self.wake.clear()
 # sole job is to enforce the work time policy
 
 
