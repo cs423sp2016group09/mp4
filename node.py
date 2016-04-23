@@ -33,6 +33,9 @@ a = [0.0] * SIZE
 # this is a blind guess
 k = 4
 
+# only do a balance transfer if there's a 5 job imbalance
+LOAD_BALANCE_THRESHOLD = 5
+
 parser = argparse.ArgumentParser()
 parser.add_argument("-r", "--remote", help="Add this flag if this is the remote node", action="store_true")
 # maybe later
@@ -50,6 +53,7 @@ def send_some_jobs(sock, jobs):
 
     messaging.send_msg(sock, data)
     # print "sent %d bytes" % len(data)
+
 
 
 def receive_data(sock):
@@ -101,11 +105,25 @@ def receive_state(message):
 
 def receive_some_jobs(message):
     jobs = json.loads(message)
+
+    job_queue_lock.acquire()
+    job_queue.extend(jobs)
+    job_queue_lock.release()
+
     return jobs
 
 job_queue = []
 finished_queue = []
 job_queue_lock = threading.Lock()
+
+
+def remove_n_jobs(n):
+    # WARNING: NOT THREAD SAFE
+    global job_queue
+    to_transfer = job_queue[-n:]
+    job_queue = job_queue[:-n]
+    return to_transfer
+
 
 work_event = threading.Event()
 load_policy_enforcer_event = threading.Event()
@@ -149,7 +167,6 @@ else:
     # print "after accept"
     # bootstrap phase
     jobs = receive_data(comm_sock)
-    job_queue.extend(jobs)
     # print "after recv"
     print "I got %d jobs from the client" % (len(jobs))
     ((first_l, first_r), last_arr) = jobs[0]
@@ -187,7 +204,7 @@ class StateManager(threading.Thread):
 
 class AdaptorThread(threading.Thread):
 
-    def __init__(self, sock):
+    def __init__(self, sock, remote, job_queue):
         '''
         Constructor
         '''
@@ -196,6 +213,8 @@ class AdaptorThread(threading.Thread):
         self.sock = sock
         self.bundle = ()
         self.wake = threading.Event()
+        self.remote = remote
+        self.job_queue = job_queue
 
     def request_calculation(self, bundle):
         self.bundle = bundle
@@ -209,6 +228,22 @@ class AdaptorThread(threading.Thread):
             (my_length, my_load_policy, other_length, other_load_policy) = self.bundle
 
             print "i'm performing a calculation on ", my_length, my_load_policy, other_length, other_load_policy
+
+            if not self.remote:
+                s = (k * other_load_policy * my_length - my_load_policy * other_length) / (k * other_load_policy + my_load_policy)
+            else:
+                s = (other_load_policy * my_length - k * my_load_policy * other_length) / (other_load_policy + k * my_load_policy)
+
+            if (s > LOAD_BALANCE_THRESHOLD):
+                print "i think we should transfer ", s, " jobs"
+                job_queue_lock.acquire()
+
+                count = int(s)
+
+                to_transfer = remove_n_jobs(count)
+
+                job_queue_lock.release()
+                transfer_manager.request_transfer(to_transfer)
 
             self.jobs_to_send = ()
             self.wake.clear()
@@ -243,16 +278,16 @@ class HardwareMonitor(threading.Thread):
 
     def run(self):
         while (self.running):
-            # time.sleep(work_interval)  # after 70 ms
-            # load_policy_enforcer_event.clear()  # put the worker to sleep
-            # time.sleep(0.1 - work_interval)  # after 30 ms
-            # load_policy_enforcer_event.set()  # wake it up
-            time.sleep(20)  # after 70 ms
+            time.sleep(self.work_interval)  # after 70 ms
             load_policy_enforcer_event.clear()  # put the worker to sleep
-            print "putting worker to sleep"
-            time.sleep(10)  # after 30 ms
+            time.sleep(0.1 - self.work_interval)  # after 30 ms
             load_policy_enforcer_event.set()  # wake it up
-            print "waking worker up"
+            # time.sleep(20)  # after 70 ms
+            # load_policy_enforcer_event.clear()  # put the worker to sleep
+            # print "putting worker to sleep"
+            # time.sleep(10)  # after 30 ms
+            # load_policy_enforcer_event.set()  # wake it up
+            # print "waking worker up"
 
 
 class WorkerThread(threading.Thread):
@@ -325,7 +360,7 @@ running = True
 worker_thread = WorkerThread()
 worker_thread.start()
 
-adaptor_thread = AdaptorThread(comm_sock)
+adaptor_thread = AdaptorThread(comm_sock, args.remote, job_queue)
 adaptor_thread.start()
 
 hardware_monitor = HardwareMonitor(comm_sock)
