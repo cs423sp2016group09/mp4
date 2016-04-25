@@ -15,7 +15,6 @@ import time
 import signal
 import messaging
 
-
 def signal_handler(signal, frame):
     print 'You pressed Ctrl+C!'
     sys.exit(0)
@@ -47,8 +46,8 @@ def job_slice(left_index, right_index):
     return ((left_index, right_index), a[left_index:right_index])
 
 
-def send_some_jobs(sock, jobs):
-    data = '#jobs#'
+def send_some_jobs(sock, jobs, finished = False):
+    data = "#finished#" if finished else '#jobs#'
     data += json.dumps(jobs)
 
     messaging.send_msg(sock, data)
@@ -86,6 +85,8 @@ def receive_data(sock):
 
     if type == "jobs":
         return receive_some_jobs(message)
+    elif type == "finished":
+        return receive_finished_jobs(message)
     elif type == "state":
         return receive_state(message)
     else:
@@ -94,28 +95,56 @@ def receive_data(sock):
 
 def receive_state(message):
     print "receiving state"
-    pats = re.match(r"(.*)#(.*)", message)
+    pats = re.match(r"(.*)#(.*)#(.*)", message)
     other_length = int(pats.group(1))
-    other_load_policy = float(pats.group(2))
+    other_finished_length = int(pats.group(2))
+    other_load_policy = float(pats.group(3))
 
-    other_state = (other_length, other_load_policy)
+    other_state = (other_length, other_finished_length, other_load_policy)
     state_manager.handle_received_state(other_state)
     return other_state
 
-
+f = open("a", "w+")
 def receive_some_jobs(message):
-    jobs = json.loads(message)
+    try:
+        jobs = json.loads(message)
+        job_queue_lock.acquire()
+        job_queue.extend(jobs)
+        job_queue_lock.release()
+        print "I got %d jobs from the client" % (len(jobs))
+        ((first_l, first_r), last_arr) = jobs[0]
+        ((last_l, last_r), last_arr) = jobs[-1]
+        print "First job is indices %d to %d\nLast job is indices %d to %d" % (first_l, first_r, last_l, last_r)
+        work_event.set()
+        return jobs
 
-    job_queue_lock.acquire()
-    job_queue.extend(jobs)
-    job_queue_lock.release()
+    except Exception, e:
+        f.write(message)
+        f.write("\n")
+        print "written to file"
 
-    return jobs
+def receive_finished_jobs(message):
+    print "receiving finished jobs"
+    try:
+        jobs = json.loads(message)
+        finished_queue_lock.acquire()
+        finished_queue.extend(jobs)
+        finished_queue_lock.release()
+        print "Finished queue adds %d jobs from the client" % (len(jobs))
+        ((first_l, first_r), last_arr) = jobs[0]
+        ((last_l, last_r), last_arr) = jobs[-1]
+        print "First job is indices %d to %d\nLast job is indices %d to %d" % (first_l, first_r, last_l, last_r)
+        work_event.set()
+        return jobs
+    except Exception, e:
+        f.write(message)
+        f.write("\n")
+        print "written to file"
 
 job_queue = []
 finished_queue = []
 job_queue_lock = threading.Lock()
-
+finished_queue_lock = threading.Lock()
 
 def remove_n_jobs(n):
     # WARNING: NOT THREAD SAFE
@@ -124,6 +153,15 @@ def remove_n_jobs(n):
     job_queue = job_queue[:-n]
     return to_transfer
 
+def add_finished_job(job):
+    global finished_queue
+    finished_queue.append(job)
+
+def remove_finished_jobs():
+    global finished_queue
+    new_finished_queue = finished_queue[:]
+    finished_queue = []
+    return new_finished_queue
 
 work_event = threading.Event()
 load_policy_enforcer_event = threading.Event()
@@ -168,10 +206,7 @@ else:
     # bootstrap phase
     jobs = receive_data(comm_sock)
     # print "after recv"
-    print "I got %d jobs from the client" % (len(jobs))
-    ((first_l, first_r), last_arr) = jobs[0]
-    ((last_l, last_r), last_arr) = jobs[-1]
-    print "First job is indices %d to %d\nLast job is indices %d to %d" % (first_l, first_r, last_l, last_r)
+
     # print next
 
 
@@ -185,18 +220,24 @@ class StateManager(threading.Thread):
         self.running = True
         self.sock = sock
 
-    def handle_received_state(self, (other_length, other_load_policy)):
+    def handle_received_state(self, (other_length, other_finished_length, other_load_policy)):
         # print "i am being asked to handle other state"
         # print "other_length", other_length, "other_lp", other_load_policy
+        job_queue_lock.acquire()
+        finished_queue_lock.acquire()
+
         my_length = len(job_queue)
+        my_finished_length = len(finished_queue)
+        job_queue_lock.release()
+        finished_queue_lock.release()
         my_load_policy = hardware_monitor.load_policy
-        bundle = (my_length, my_load_policy, other_length, other_load_policy)
+        bundle = (my_length, my_finished_length, my_load_policy, other_length, other_finished_length, other_load_policy)
         # send bundle to adapter
         adaptor_thread.request_calculation(bundle)
 
     def run(self):
         while (self.running):
-            time.sleep(5)
+            time.sleep(30)
             # data = "#%f#%d#" % (load_policy, len(job_queue))
             # send_msg(self.sock, data)
             hardware_monitor.send_state(self.sock)
@@ -225,9 +266,10 @@ class AdaptorThread(threading.Thread):
             self.wake.wait()
             # do some work
 
-            (my_length, my_load_policy, other_length, other_load_policy) = self.bundle
-
-            print "i'm performing a calculation on ", my_length, my_load_policy, other_length, other_load_policy
+            (my_length, my_finished_length, my_load_policy, other_length, other_finished_length, other_load_policy) = self.bundle
+            if (my_length == 0 and  my_finished_length == 0 and other_length == 0 and other_finished_length == 0):
+                shutdown()
+            print "i'm performing a calculation on ", my_length, my_load_policy, other_length, other_load_policy    
 
             if not self.remote:
                 s = (k * other_load_policy * my_length - my_load_policy * other_length) / (k * other_load_policy + my_load_policy)
@@ -262,7 +304,11 @@ class HardwareMonitor(threading.Thread):
         self.update_work_interval()
 
     def send_state(self, sock):
-        data = "#state#%d#%f" % (len(job_queue), self.load_policy)
+        job_queue_lock.acquire()
+        finished_queue_lock.acquire()
+        data = "#state#%d#%d#%f" % (len(job_queue),(len(finished_queue)), self.load_policy)
+        job_queue_lock.release()
+        finished_queue_lock.release()
         messaging.send_msg(sock, data)
 
     def set_load_policy(self, new_load_policy):
@@ -292,12 +338,13 @@ class HardwareMonitor(threading.Thread):
 
 class WorkerThread(threading.Thread):
 
-    def __init__(self):
+    def __init__(self, transfer_manager):
         '''
         Constructor
         '''
         threading.Thread.__init__(self)
         self.running = True
+        self.transfer_manager = transfer_manager
 
     @staticmethod
     def run_job(job):
@@ -311,7 +358,23 @@ class WorkerThread(threading.Thread):
         while (self.running):
 
             if len(job_queue) == 0:
+                work_event.clear()
                 print "done with jobs"
+
+                finished_queue_lock.acquire()
+                new_finished_queue = remove_finished_jobs()
+                finished_queue_lock.release()
+
+                if len(new_finished_queue) > 0:
+                    if (not args.remote): 
+                        print "Applying ", len(new_finished_queue), " completed jobs"
+                        for i in range(len(new_finished_queue)):
+                            ((first_l, first_r), last_arr) = new_finished_queue[i]
+                            a[first_l:first_r] = last_arr
+                    else:
+                        print "sending", len(new_finished_queue), " jobs"
+                        self.transfer_manager.request_transfer(new_finished_queue, True)
+
                 work_event.wait()
             else:
                 job_queue_lock.acquire()
@@ -327,7 +390,7 @@ class WorkerThread(threading.Thread):
                         load_policy_enforcer_event.wait()
                         array[i] += 1.111111
 
-                finished_queue.append(job)
+                add_finished_job(job)
                 # a[left_index:right_index] = array
 
 
@@ -343,22 +406,21 @@ class TransferManager(threading.Thread):
         self.wake = threading.Event()
         self.jobs_to_send = []
 
-    def request_transfer(self, jobs):
+    def request_transfer(self, jobs, finished = False):
         self.wake.set()
         self.jobs_to_send = jobs
+        self.finished = finished
 
     def run(self):
         while (self.running):
             self.wake.wait()
             # do some work
-            send_some_jobs(self.sock, self.jobs_to_send)
+            send_some_jobs(self.sock, self.jobs_to_send, self.finished)
             self.jobs_to_send = []
             self.wake.clear()
 
 
 running = True
-worker_thread = WorkerThread()
-worker_thread.start()
 
 adaptor_thread = AdaptorThread(comm_sock, args.remote, job_queue)
 adaptor_thread.start()
@@ -369,10 +431,25 @@ hardware_monitor.start()
 transfer_manager = TransferManager(comm_sock)
 transfer_manager.start()
 
+worker_thread = WorkerThread(transfer_manager)
+worker_thread.start()
+
+
 state_manager = StateManager(comm_sock)
 state_manager.start()
 
 read_fds = [sys.stdin, comm_sock]
+def shutdown():
+    global running
+    running = False
+    worker_thread.running = False
+    adaptor_thread.running = False
+    hardware_monitor.running = False
+    transfer_manager.running = False
+    state_manager.running = False
+    work_event.set()
+
+
 while running:
     # block until we receive packets or keyboard read_fds
     (senders, _, _) = select.select(read_fds, [], [])
