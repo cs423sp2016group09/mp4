@@ -380,9 +380,8 @@ class WorkerThread(threading.Thread):
                 job_queue_lock.acquire()
                 job = job_queue.pop()
                 job_queue_lock.release()
-                print "popped new job "
                 ((left_index, right_index), array) = job
-
+              	print "Popped new job with starting index: %d and end index: %d" %(left_index, right_index)
                 # WorkerThread.run_job(job)
                 (_, array) = job
                 for i in range(len(array)):
